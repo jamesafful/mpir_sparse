@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mpir-sparse"
+version = "0.1.0"
+description = "Adaptive mixed-precision iterative refinement for sparse linear systems (with ILU/AMG hooks)."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "Your Name"}]
+license = {text = "MIT"}
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "matplotlib>=3.7",
+  "pyamg>=5.0.1",
+  "ssgetpy>=1.0.3",
+]
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ipykernel", "jupyter"]
