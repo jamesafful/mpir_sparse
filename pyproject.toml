@@ -15,7 +15,14 @@ dependencies = [
   "scipy>=1.10",
   "matplotlib>=3.7",
   "pyamg>=5.0.1",
-  "ssgetpy>=1.0.3",
 ]
+
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ipykernel", "jupyter"]
+benchmarks = ["ssgetpy==1.0rc2"]  # pre-release only available on PyPI
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]

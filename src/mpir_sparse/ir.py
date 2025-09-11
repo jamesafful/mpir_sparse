@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Optional, Tuple, Dict, Any, List, Union
 import numpy as np
 import scipy.sparse as sp
@@ -19,7 +19,7 @@ class IRConfig:
     work_dtype: np.dtype = np.float32
     estimate_kappa: bool = True
     kappa_checks: int = 2
-    scheduler: SchedulerConfig = SchedulerConfig()
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)  # ✅
 
 @dataclass
 class IRInfo:
@@ -38,8 +38,29 @@ def _gmres(Aop: spla.LinearOperator,
            maxit_inner: int,
            M: Optional[spla.LinearOperator] = None) -> np.ndarray:
     rhs = rhs64.astype(Aop.dtype, copy=False)
-    d, info = spla.gmres(Aop, rhs, tol=rtol_inner, restart=None, maxiter=maxit_inner, M=M)
-    return d.astype(np.float64, copy=False)
+    # Prefer new SciPy API (≥1.11) and fall back to legacy.
+    try:
+        d, info = spla.gmres(Aop, rhs,
+                             rtol=rtol_inner, atol=0.0,
+                             maxiter=maxit_inner, M=M)
+    except TypeError:
+        # Older SciPy expects `tol=` and may ignore `atol`.
+        d, info = spla.gmres(Aop, rhs,
+                             tol=rtol_inner,
+                             maxiter=maxit_inner, M=M)
+    if info != 0:
+        raise RuntimeError(f"Inner GMRES failed to converge: info={info}")
+    return d
+
+
+# def _gmres(Aop: spla.LinearOperator,
+#            rhs64: np.ndarray,
+#            rtol_inner: float,
+#            maxit_inner: int,
+#            M: Optional[spla.LinearOperator] = None) -> np.ndarray:
+#     rhs = rhs64.astype(Aop.dtype, copy=False)
+#     d, info = spla.gmres(Aop, rhs, tol=rtol_inner, restart=None, maxiter=maxit_inner, M=M)
+#     return d.astype(np.float64, copy=False)
 
 def _kappa_proxy(A64, Aop_work, trials: int = 2) -> float:
     Anorm = power_norm2(A64, iters=10)

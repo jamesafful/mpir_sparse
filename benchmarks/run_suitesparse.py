@@ -1,4 +1,16 @@
 #!/usr/bin/env python
+
+try:
+    import ssgetpy
+except Exception as e:
+    raise SystemExit(
+        "This script requires ssgetpy.\n"
+        "Install with either:\n"
+        "  pip install ssgetpy==1.0rc2\n"
+        "or (recommended for this repo):\n"
+        "  pip install -e .[benchmarks]\n"
+    ) from e
+
 from __future__ import annotations
 import argparse, os, time, json
 import numpy as np
