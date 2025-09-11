@@ -26,3 +26,6 @@ jupyter notebook notebooks/01_quick_demo.ipynb
 ## License
 
 MIT
+
+
+![CI](https://github.com/jamesafful/mpir_sparse/actions/workflows/ci.yml/badge.svg)

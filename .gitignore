@@ -1,11 +1,22 @@
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.env
-.venv
-.ipynb_checkpoints/
-.cache/
-dist/
-build/
+*.py[cod]
 *.egg-info/
+*.egg
+.dist/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtualenvs
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db

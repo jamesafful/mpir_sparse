@@ -11,7 +11,6 @@ except Exception as e:
         "  pip install -e .[benchmarks]\n"
     ) from e
 
-from __future__ import annotations
 import argparse, os, time, json
 import numpy as np
 import scipy.sparse as sp
