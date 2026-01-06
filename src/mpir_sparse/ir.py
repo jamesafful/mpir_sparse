@@ -16,6 +16,7 @@ from .utils import (
 )
 from .schedulers import AdaptiveScheduler, SchedulerConfig
 from .preconditioners import make_preconditioner_with_info
+from .tracing import JSONLTraceWriter
 
 ArrayLike = Union[np.ndarray, sp.spmatrix, spla.LinearOperator]
 
@@ -41,6 +42,20 @@ class IRConfig:
     scaling: Optional[str] = None  # None or "diag"
     residual_replacement: int = 0  # recompute residual every N outer steps (0 disables; residual is always computed in high precision anyway)
     max_inner_retries: int = 1     # extra attempts on inner solver failure
+    # Adaptivity switches
+    adaptive: bool = True  # if False, disables scheduler decisions
+
+    # Tracing (JSONL)
+    trace_path: Optional[str] = None  # if set, writes a JSONL trace
+    trace_every: int = 1  # write every N outer iterations
+
+    # Preconditioner refresh (ILU only, simple parameter tightening)
+    precond_refresh: bool = False
+    precond_refresh_max: int = 3
+    ilu_drop_tol_min: float = 1e-8
+    ilu_fill_factor_max: float = 50.0
+    ilu_drop_tol_shrink: float = 0.1  # drop_tol *= shrink on refresh
+    ilu_fill_factor_grow: float = 1.5  # fill_factor *= grow on refresh
 
     # Diagnostics / adaptivity
     estimate_kappa: bool = True
@@ -58,6 +73,8 @@ class IRInfo:
     final_backward_error: float
     A_norm_est: float
     notes: Dict[str, Any]
+    trace_path: Optional[str] = None
+    preconditioner_history: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def _krylov_solve(
@@ -69,33 +86,42 @@ def _krylov_solve(
     maxit: int,
     restart: Optional[int],
     M: Optional[spla.LinearOperator],
-) -> Tuple[np.ndarray, int]:
+) -> Tuple[np.ndarray, int, int]:
     """Solve A d ≈ rhs using a chosen Krylov method.
 
-    Returns (d, info_flag) where info_flag is 0 on success, nonzero otherwise.
+    Returns (d, info_flag, inner_iters) where info_flag is 0 on success.
     """
     rhs = rhs64.astype(Aop.dtype, copy=False)
 
+    inner_iters = 0
+    def _cb(*args, **kwargs):
+        nonlocal inner_iters
+        inner_iters += 1
+
     if solver.lower() == "gmres":
-        # SciPy API changed around 1.11 (rtol/atol vs tol)
+        # SciPy API changed around 1.11 (rtol/atol vs tol).
+        # We attach a callback to count inner iterations in a version-tolerant way.
         try:
-            d, info = spla.gmres(Aop, rhs, M=M, restart=restart, maxiter=maxit, rtol=rtol, atol=atol)
+            d, info = spla.gmres(
+                Aop, rhs, M=M, restart=restart, maxiter=maxit, rtol=rtol, atol=atol,
+                callback=_cb, callback_type='pr_norm'
+            )
         except TypeError:
-            # Older SciPy: tol parameter; may not accept atol/restart
-            kwargs: Dict[str, Any] = {"M": M, "maxiter": maxit, "tol": rtol}
+            # Older SciPy: tol parameter; may not accept atol/restart/callback_type
+            kwargs: Dict[str, Any] = {'M': M, 'maxiter': maxit, 'tol': rtol, 'callback': _cb}
             if restart is not None:
-                kwargs["restart"] = restart
+                kwargs['restart'] = restart
             d, info = spla.gmres(Aop, rhs, **kwargs)
-        return np.asarray(d, dtype=Aop.dtype), int(info)
+        return np.asarray(d, dtype=Aop.dtype), int(info), int(inner_iters)
 
     if solver.lower() == "lgmres":
         # LGMRES is a flexible variant (handles varying/inexact preconditioning better).
         try:
-            d, info = spla.lgmres(Aop, rhs, M=M, maxiter=maxit, tol=rtol)
+            d, info = spla.lgmres(Aop, rhs, M=M, maxiter=maxit, tol=rtol, callback=_cb)
         except TypeError:
             # Some versions accept rtol/atol; keep compatibility
-            d, info = spla.lgmres(Aop, rhs, M=M, maxiter=maxit, rtol=rtol, atol=atol)
-        return np.asarray(d, dtype=Aop.dtype), int(info)
+            d, info = spla.lgmres(Aop, rhs, M=M, maxiter=maxit, rtol=rtol, atol=atol, callback=_cb)
+        return np.asarray(d, dtype=Aop.dtype), int(info), int(inner_iters)
 
     raise ValueError(f"Unknown inner_solver: {solver}")
 
@@ -108,7 +134,7 @@ def _kappa_proxy(A64, Aop_work, trials: int = 2) -> float:
     rng = np.random.default_rng(0)
     for _ in range(trials):
         g = rng.standard_normal(n).astype(np.float64)
-        y, info = _krylov_solve("gmres", Aop_work, g, rtol=1e-2, atol=0.0, maxit=200, restart=None, M=None)
+        y, info, _ = _krylov_solve("gmres", Aop_work, g, rtol=1e-2, atol=0.0, maxit=200, restart=None, M=None)
         if info != 0:
             continue
         Ay = (A64 @ y.astype(np.float64))
@@ -166,6 +192,11 @@ def iterative_refinement(
         if prec_info is not None:
             notes["preconditioner"] = {"kind": prec_info.kind, **prec_info.params}
 
+    prec_hist: List[Dict[str, Any]] = []
+    if prec_info is not None:
+        prec_hist.append({'kind': prec_info.kind, **prec_info.params})
+    refresh_count = 0
+
     # Initial guess in high precision (solution is returned in the original variable after unscale)
     x = np.zeros(n, dtype=config.residual_dtype) if x0 is None else np.array(x0, dtype=config.residual_dtype, copy=True)
 
@@ -176,7 +207,24 @@ def iterative_refinement(
     A_norm_est = float(power_norm2(A64, iters=15))
     r = b_work.astype(config.residual_dtype, copy=False) - (A64 @ x)
     res_hist = [float(np.linalg.norm(r))]
+
+    # Optional JSONL tracing
+    trace = None
+    if config.trace_path is not None:
+        trace = JSONLTraceWriter(config.trace_path)
+        trace.write({
+            'event': 'init',
+            'n': int(n),
+            'preconditioner': preconditioner,
+            'work_dtype': str(work_dtype),
+            'rtol_inner': float(config.rtol_inner),
+            'restart': config.restart,
+            'inner_solver': config.inner_solver,
+            'res_norm': float(res_hist[-1]),
+        })
     used_precisions = [str(work_dtype)]
+    eta_history: List[float] = []  # inner correction quality ||A d - r|| / ||r||
+    inner_iters_history: List[int] = []
     escalations: List[str] = []
 
     # Initial kappa proxy
@@ -201,10 +249,17 @@ def iterative_refinement(
         return work_dtype, None
 
     for k in range(config.k_max):
+        action_notes: List[str] = []
+        r_norm_before = float(np.linalg.norm(r))
         if backward_error_ok(A_norm_est, x, b_work, r, config.tol):
             be = float(np.linalg.norm(r) / (A_norm_est * np.linalg.norm(x) + np.linalg.norm(b_work)))
             x_out = unscale(x)
-            return x_out, IRInfo(True, k, res_hist, used_precisions, escalations, be, A_norm_est, notes)
+            notes['eta_history'] = eta_history
+            notes['inner_iters_history'] = inner_iters_history
+            if trace is not None:
+                trace.write({'event': 'converged', 'iter': int(k), 'res_norm': float(res_hist[-1]), 'backward_error': float(be)})
+                trace.close()
+            return x_out, IRInfo(True, k, res_hist, used_precisions, escalations, be, A_norm_est, notes, trace_path=config.trace_path, preconditioner_history=prec_hist)
 
         # Inner solve with a small retry ladder
         attempt = 0
@@ -214,7 +269,7 @@ def iterative_refinement(
         d = None
 
         while True:
-            d_try, info = _krylov_solve(
+            d_try, info, inner_iters = _krylov_solve(
                 local_solver, Aop, r, rtol=local_rtol, atol=config.atol_inner,
                 maxit=local_maxit, restart=config.restart, M=M
             )
@@ -249,17 +304,52 @@ def iterative_refinement(
 
         assert d is not None
 
+        # Inner correction quality (eta): ||A d - r|| / ||r||, measured in high precision
+        r_before = r
+        rnorm = float(np.linalg.norm(r_before))
+        if rnorm == 0.0:
+            eta = 0.0
+        else:
+            eta = float(np.linalg.norm((A64 @ d) - r_before) / rnorm)
+        eta_history.append(eta)
+        inner_iters_history.append(int(inner_iters))
+
+        # Apply correction and recompute residual in high precision
         x = x + d
         r = b_work.astype(config.residual_dtype, copy=False) - (A64 @ x)
         res_hist.append(float(np.linalg.norm(r)))
+        rho = float(res_hist[-1] / res_hist[-2]) if res_hist[-2] > 0 else float('inf')
 
         # Scheduler decision (tighten inner tol or escalate precision)
-        new_rtol, new_dtype, note = sched.update_and_decide(res_hist, rtol, work_dtype, _escalate_precision)
-        if note:
-            escalations.append(f"{note} at iter {k+1}")
-        rtol = float(new_rtol)
-        if new_dtype != work_dtype:
-            _rebuild_operator(new_dtype)
+        if config.adaptive:
+            new_rtol, new_dtype, note = sched.update_and_decide(res_hist, rtol, work_dtype, _escalate_precision)
+            if note:
+                escalations.append(f"{note} at iter {k+1}")
+                action_notes.append(note)
+            rtol = float(new_rtol)
+            if new_dtype != work_dtype:
+                _rebuild_operator(new_dtype)
+                action_notes.append(f"dtype->{new_dtype}")
+        else:
+            note = None
+
+        # Optional ILU preconditioner refresh (simple tightening) when progress is poor but inner solve is effective
+        if (config.precond_refresh and preconditioner == 'ilu' and prec_info is not None and refresh_count < config.precond_refresh_max):
+            # Heuristic: if outer residual isn't contracting but eta suggests the correction solve is accurate, refresh ILU.
+            if (rho > config.scheduler.stagnation_ratio) and (eta <= 0.2):
+                drop_tol = float(precond_kwargs.get('drop_tol', prec_info.params.get('drop_tol', 1e-4)))
+                fill_factor = float(precond_kwargs.get('fill_factor', prec_info.params.get('fill_factor', 10.0)))
+                new_drop = max(config.ilu_drop_tol_min, drop_tol * config.ilu_drop_tol_shrink)
+                new_fill = min(config.ilu_fill_factor_max, fill_factor * config.ilu_fill_factor_grow)
+                if (new_drop < drop_tol) or (new_fill > fill_factor):
+                    precond_kwargs['drop_tol'] = new_drop
+                    precond_kwargs['fill_factor'] = new_fill
+                    M, prec_info = make_preconditioner_with_info(A64, kind='ilu', **precond_kwargs)
+                    refresh_count += 1
+                    prec_hist.append({'kind': prec_info.kind, **prec_info.params})
+                    msg = f"ilu_refresh drop_tol {drop_tol:.1e}->{new_drop:.1e}, fill {fill_factor:.1f}->{new_fill:.1f}"
+                    escalations.append(f"{msg} at iter {k+1}")
+                    action_notes.append(msg)
 
         # Optional periodic kappa monitoring
         if config.estimate_kappa and (k == 0 or (k + 1) % 3 == 0):
@@ -270,10 +360,31 @@ def iterative_refinement(
                 if note2:
                     escalations.append(f"{note2} at iter {k+1}")
 
+
+        # Trace this outer iteration
+        if trace is not None and config.trace_every > 0 and ((k + 1) % config.trace_every == 0):
+            trace.write({
+                'event': 'outer_iter',
+                'iter': int(k + 1),
+                'res_norm_before': float(r_norm_before),
+                'res_norm_after': float(res_hist[-1]),
+                'rho': float(rho),
+                'eta': float(eta),
+                'inner_iters': int(inner_iters_history[-1]),
+                'rtol_inner': float(rtol),
+                'work_dtype': str(work_dtype),
+                'inner_solver': str(local_solver),
+                'actions': list(action_notes),
+            })
     converged = backward_error_ok(A_norm_est, x, b_work, r, config.tol)
     be = float(np.linalg.norm(r) / (A_norm_est * np.linalg.norm(x) + np.linalg.norm(b_work)))
     x_out = unscale(x)
-    return x_out, IRInfo(converged, len(res_hist) - 1, res_hist, used_precisions, escalations, be, A_norm_est, notes)
+    notes['eta_history'] = eta_history
+    notes['inner_iters_history'] = inner_iters_history
+    if trace is not None:
+        trace.write({'event': 'done', 'iter': int(len(res_hist)-1), 'res_norm': float(res_hist[-1]), 'backward_error': float(be), 'converged': bool(converged)})
+        trace.close()
+    return x_out, IRInfo(converged, len(res_hist) - 1, res_hist, used_precisions, escalations, be, A_norm_est, notes, trace_path=config.trace_path, preconditioner_history=prec_hist)
 
 
 def solve(
@@ -288,6 +399,10 @@ def solve(
     inner_solver: str = "gmres",
     restart: Optional[int] = None,
     scaling: Optional[str] = None,
+    adaptive: bool = True,
+    trace_path: Optional[str] = None,
+    trace_every: int = 1,
+    precond_refresh: bool = False,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """Convenience wrapper around iterative_refinement.
 
@@ -301,6 +416,10 @@ def solve(
         inner_solver=inner_solver,
         restart=restart,
         scaling=scaling,
+        adaptive=adaptive,
+        trace_path=trace_path,
+        trace_every=trace_every,
+        precond_refresh=precond_refresh,
     )
     x, info = iterative_refinement(A, b, None, cfg, preconditioner, precond_kwargs)
     return x, asdict(info)
